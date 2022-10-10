@@ -33,6 +33,13 @@ public class AccessibleProperty {
         return obj;
     }
 
+    public void set(Object bean, Object value) throws ReflectiveOperationException {
+        if (this.sqlToJavaMapper != null) {
+            value = this.sqlToJavaMapper.apply(value);
+        }
+        this.field.set(bean, value);
+    }
+
     boolean isId() {
         return this.field.getAnnotation(Id.class) != null;
     }

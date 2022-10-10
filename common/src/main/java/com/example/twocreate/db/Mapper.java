@@ -2,6 +2,7 @@ package com.example.twocreate.db;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.ResultSetExtractor;
 
 import javax.persistence.Table;
@@ -9,6 +10,9 @@ import javax.persistence.Transient;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -67,14 +71,50 @@ final class Mapper<T> {
         this.tableName = getTableName(clazz);
         this.selectSQL = "SELECT * FROM " + this.tableName + " WHERE " + this.id.propertyName + " = ?";
         this.insertSQL = "INSERT INTO " + this.tableName + " ("
-                + String.join(", ",this.insertableProperties.stream().map(p -> p.propertyName).toArray(String[]::new))
+                + String.join(", ", this.insertableProperties.stream().map(p -> p.propertyName).toArray(String[]::new))
                 + ") VALUES (" + numOfQuestions(this.insertableProperties.size()) + ")";
-        this.insertIgnoreSQL = this.insertSQL.replace("INSERT INTO","INSERT IGNORE INTO");
+        this.insertIgnoreSQL = this.insertSQL.replace("INSERT INTO", "INSERT IGNORE INTO");
+        this.updateSQL = "UPDATE" + this.tableName + " SET "
+                + String.join(", ", this.updatableProperties.stream().map(p -> p.propertyName + " = ?").toArray(String[]::new))
+                + " WHERE " + this.id.propertyName + " = ? ";
+        this.deleteSQL = "DELETE FROM " + this.tableName + " WHERE " + this.id.propertyName + " = ?";
+        this.resultSetExtractor = new ResultSetExtractor<>() {
+            @Override
+            public List<T> extractData(ResultSet rs) throws SQLException, DataAccessException {
+                final List<T> results = new ArrayList<>();
+                final ResultSetMetaData m = rs.getMetaData();
+                final int cols = m.getColumnCount();
+                final String[] names = new String[cols];
+                for (int i = 0; i < cols; i++) {
+                    names[i] = m.getColumnName(i + 1);
+                }
+                try {
+                    while (rs.next()) {
+                        T bean = newInstance();
+                        for (int i = 0; i < cols; i++) {
+                            String name = names[i];
+                            AccessibleProperty p = allPropertiesMap.get(name);
+                            if (p != null) {
+                                p.set(bean, rs.getObject(i + 1));
+                            }
+                        }
+                        results.add(bean);
+                    }
+                } catch (ReflectiveOperationException e) {
+                    throw new RuntimeException(e);
+                }
+                return results;
+            }
+        };
     }
 
-    Map<String, AccessibleProperty> buildPropertiesMap(List<AccessibleProperty> props){
-        Map<String , AccessibleProperty> map = new HashMap<>();
-        for (AccessibleProperty prop: props) {
+    Object getIdValue(Object bean) throws ReflectiveOperationException {
+        return this.id.get(bean);
+    }
+
+    Map<String, AccessibleProperty> buildPropertiesMap(List<AccessibleProperty> props) {
+        Map<String, AccessibleProperty> map = new HashMap<>();
+        for (AccessibleProperty prop : props) {
             map.put(prop.propertyName, prop);
         }
         return map;
@@ -86,7 +126,8 @@ final class Mapper<T> {
             return "?";
         }).toArray(String[]::new));
     }
-    private String getTableName(Class<?> clazz){
+
+    private String getTableName(Class<?> clazz) {
         Table table = clazz.getAnnotation(Table.class);
         if (table != null && !table.name().isEmpty()) {
             return table.name();
@@ -94,6 +135,7 @@ final class Mapper<T> {
         String name = clazz.getSimpleName();
         return Character.toLowerCase(name.charAt(0)) + name.substring(1);
     }
+
     private List<AccessibleProperty> getProperties(Class<?> clazz) throws Exception {
         List<AccessibleProperty> properties = new ArrayList<>();
         for (Field f : clazz.getFields()) {
@@ -108,5 +150,72 @@ final class Mapper<T> {
             properties.add(p);
         }
         return properties;
+    }
+
+    public String ddl() {
+        StringBuilder sb = new StringBuilder(256);
+        sb.append("CREATE TABLE ").append(this.tableName).append(" (\n");
+        sb.append(String.join(",\n", this.allProperties.stream().sorted((o1, o2) -> {
+            if (o1.isId()) {
+                return -1;
+            }
+            if (o2.isId()) {
+                return 1;
+            }
+            return o1.propertyName.compareTo(o2.propertyName);
+        }).map((p) -> " " + p.propertyName + " " + p.columnDefinition).toArray(String[]::new)));
+        sb.append(",\n");
+        // add unique key:
+        sb.append(getUniqueKey());
+        // add index:
+        sb.append(getIndex());
+        // add primary key:
+        sb.append("  PRIMARY KEY(").append(this.id.propertyName).append(")\n");
+        sb.append(") CHARACTER SET utf8 COLLATE utf8_general_ci AUTO_INCREMENT = 1000;\n");
+        return sb.toString();
+    }
+
+    String getUniqueKey() {
+        Table table = this.entityClass.getAnnotation(Table.class);
+        if (table != null) {
+            return Arrays.stream(table.uniqueConstraints()).map((c) -> {
+                String name = c.name().isEmpty() ? "UNI_" + String.join("_", c.columnNames()) : c.name();
+                return "  CONSTRAINT " + name + " UNIQUE (" + String.join(", ", c.columnNames()) + "),\n";
+            }).reduce("", (acc, s) -> {
+                return acc + s;
+            });
+        }
+        return "";
+    }
+
+    String getIndex() {
+        Table table = this.entityClass.getAnnotation(Table.class);
+        if (table != null) {
+            return Arrays.stream(table.indexes()).map((c) -> {
+                if (c.unique()) {
+                    String name = c.name().isEmpty() ? "UNI_" + c.columnList().replace(" ", "").replace(",", "_") : c.name();
+                    return "  CONSTRAINT " + name + " UNIQUE (" + c.columnList() + "),\n";
+                } else {
+                    String name = c.name().isEmpty() ? "IDX_" + c.columnList().replace(" ", "").replace(",", "_") : c.name();
+                    return "  INDEX " + name + " (" + c.columnList() + "),\n";
+                }
+            }).reduce("", (acc, s) -> acc + s
+            );
+        }
+        return "";
+
+    }
+
+    static List<String> columnDefinitionSortBy = Arrays.asList("BIT", "BOOL", "TINYINT", "SMALLINT", "MEDIUMINT", "INT",
+            "INTEGER", "BIGINT", "FLOAT", "REAL", "DOUBLE", "DECIMAL", "YEAR", "DATE", "TIME", "DATETIME", "TIMESTAMP",
+            "VARCHAR", "CHAR", "BLOB", "TEXT", "MEDIUMTEXT");
+
+    static int columnDefinitionSortIndex(String definition) {
+        int pos = definition.indexOf('(');
+        if (pos > 0) {
+            definition = definition.substring(0, pos);
+        }
+        int index = columnDefinitionSortBy.indexOf(definition.toUpperCase());
+        return index == (-1) ? Integer.MAX_VALUE : index;
     }
 }
